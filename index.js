@@ -118,7 +118,6 @@ app.get('/api/user/:username', async (req, res) => {
       followers: null,
       following: null,
       posts: null
-      dev @YuichiOlds
     };
 
     // Method 1: Try to extract from script tags with JSON data
