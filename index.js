@@ -1,7 +1,6 @@
 const express = require('express');
 const axios = require('axios');
 const cors = require('cors');
-const { HttpsProxyAgent } = require('https-proxy-agent');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -74,53 +73,6 @@ function getRandomUserAgent() {
   return userAgents[Math.floor(Math.random() * userAgents.length)];
 }
 
-// Parse proxy list from environment variable
-// Format: PROXY_LIST=http://proxy1:port,http://proxy2:port,http://proxy3:port
-function getProxyList() {
-  const proxyList = process.env.PROXY_LIST;
-  if (!proxyList) return [];
-  return proxyList.split(',').map(p => p.trim()).filter(p => p);
-}
-
-// Get random proxy
-let proxyIndex = 0;
-function getNextProxy() {
-  const proxies = getProxyList();
-  if (proxies.length === 0) return null;
-  
-  const proxy = proxies[proxyIndex];
-  proxyIndex = (proxyIndex + 1) % proxies.length;
-  return proxy;
-}
-
-// Helper function to extract Instagram data from HTML
-function extractInstagramData(html) {
-  try {
-    // Look for the shared data JSON in the HTML
-    const regex = /<script type="application\/ld\+json">({.*?})<\/script>/s;
-    const match = html.match(regex);
-    
-    if (match && match[1]) {
-      const jsonData = JSON.parse(match[1]);
-      return jsonData;
-    }
-
-    // Alternative method: Look for window._sharedData
-    const sharedDataRegex = /window\._sharedData\s*=\s*({.+?});<\/script>/s;
-    const sharedDataMatch = html.match(sharedDataRegex);
-    
-    if (sharedDataMatch && sharedDataMatch[1]) {
-      const sharedData = JSON.parse(sharedDataMatch[1]);
-      return sharedData;
-    }
-
-    return null;
-  } catch (error) {
-    console.error('Error extracting Instagram data:', error);
-    return null;
-  }
-}
-
 // API endpoint to get Instagram profile info
 app.get('/api/user/:username', async (req, res) => {
   try {
@@ -128,6 +80,7 @@ app.get('/api/user/:username', async (req, res) => {
     
     if (!username) {
       return res.status(400).json({ 
+        success: false,
         error: 'Username is required' 
       });
     }
@@ -137,85 +90,133 @@ app.get('/api/user/:username', async (req, res) => {
       headers: {
         'User-Agent': getRandomUserAgent(),
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.5',
+        'Accept-Language': 'en-US,en;q=0.9',
         'Accept-Encoding': 'gzip, deflate, br',
         'Connection': 'keep-alive',
         'Upgrade-Insecure-Requests': '1',
         'Sec-Fetch-Dest': 'document',
         'Sec-Fetch-Mode': 'navigate',
         'Sec-Fetch-Site': 'none',
-        'Cache-Control': 'max-age=0'
+        'Sec-Fetch-User': '?1',
+        'Cache-Control': 'max-age=0',
+        'TE': 'trailers'
       }
     };
-
-    // Add proxy if configured
-    const proxy = getNextProxy();
-    if (proxy) {
-      config.httpsAgent = new HttpsProxyAgent(proxy);
-      config.proxy = false; // Disable axios default proxy handling
-    }
 
     // Fetch Instagram profile page
     const response = await axios.get(`https://www.instagram.com/${username}/`, config);
     const html = response.data;
     
-    // Extract structured data
-    const structuredData = extractInstagramData(html);
+    // Initialize profile data
+    const profileData = {
+      username: username,
+      name: null,
+      bio: null,
+      profilePicUrl: null,
+      isVerified: false,
+      url: `https://www.instagram.com/${username}/`,
+      followers: null,
+      following: null,
+      posts: null
+      dev @YuichiOlds
+    };
+
+    // Method 1: Try to extract from script tags with JSON data
+    const scriptRegex = /<script type="application\/ld\+json">(.+?)<\/script>/gs;
+    const scriptMatches = html.matchAll(scriptRegex);
     
-    if (structuredData) {
-      // Parse the structured data (JSON-LD format)
-      const profileData = {
-        username: username,
-        name: structuredData.name || null,
-        bio: structuredData.description || null,
-        profilePicUrl: structuredData.image || null,
-        isVerified: structuredData.isVerified || false,
-        url: structuredData.url || `https://www.instagram.com/${username}/`,
-      };
-
-      // Try to extract follower/following counts from HTML
-      const followersMatch = html.match(/"edge_followed_by":\s*{\s*"count":\s*(\d+)\s*}/);
-      const followingMatch = html.match(/"edge_follow":\s*{\s*"count":\s*(\d+)\s*}/);
-      const postsMatch = html.match(/"edge_owner_to_timeline_media":\s*{\s*"count":\s*(\d+)\s*}/);
-
-      if (followersMatch) profileData.followers = parseInt(followersMatch[1]);
-      if (followingMatch) profileData.following = parseInt(followingMatch[1]);
-      if (postsMatch) profileData.posts = parseInt(postsMatch[1]);
-
-      return res.json({
-        success: true,
-        data: profileData
-      });
+    for (const match of scriptMatches) {
+      try {
+        const jsonData = JSON.parse(match[1]);
+        if (jsonData['@type'] === 'ProfilePage' || jsonData.name) {
+          profileData.name = jsonData.name || profileData.name;
+          profileData.bio = jsonData.description || profileData.bio;
+          profileData.profilePicUrl = jsonData.image || profileData.profilePicUrl;
+          if (jsonData.interactionStatistic) {
+            jsonData.interactionStatistic.forEach(stat => {
+              if (stat.interactionType === 'http://schema.org/FollowAction') {
+                profileData.followers = parseInt(stat.userInteractionCount);
+              }
+            });
+          }
+        }
+      } catch (e) {
+        // Continue to next script tag
+      }
     }
 
-    // Fallback: Basic parsing from HTML meta tags
+    // Method 2: Extract from meta tags
     const nameMatch = html.match(/<meta property="og:title" content="([^"]+)"/);
     const descMatch = html.match(/<meta property="og:description" content="([^"]+)"/);
     const imageMatch = html.match(/<meta property="og:image" content="([^"]+)"/);
 
-    const basicData = {
-      username: username,
-      name: nameMatch ? nameMatch[1].split('(')[0].trim() : null,
-      bio: descMatch ? descMatch[1].split(' - ')[0] : null,
-      profilePicUrl: imageMatch ? imageMatch[1] : null,
-      url: `https://www.instagram.com/${username}/`
-    };
-
-    // Extract stats from description
-    if (descMatch) {
+    if (nameMatch && !profileData.name) {
+      profileData.name = nameMatch[1].split('(')[0].trim();
+    }
+    
+    if (descMatch && !profileData.bio) {
       const desc = descMatch[1];
-      const followersMatch = desc.match(/(\d+(?:,\d+)*)\s*Followers/);
-      const followingMatch = desc.match(/(\d+(?:,\d+)*)\s*Following/);
-      const postsMatch = desc.match(/(\d+(?:,\d+)*)\s*Posts/);
+      
+      // Extract stats from description
+      const followersMatch = desc.match(/([\d,\.]+[KMB]?)\s*Followers/i);
+      const followingMatch = desc.match(/([\d,\.]+[KMB]?)\s*Following/i);
+      const postsMatch = desc.match(/([\d,\.]+[KMB]?)\s*Posts/i);
 
-      if (followersMatch) basicData.followers = parseInt(followersMatch[1].replace(/,/g, ''));
-      if (followingMatch) basicData.following = parseInt(followingMatch[1].replace(/,/g, ''));
-      if (postsMatch) basicData.posts = parseInt(postsMatch[1].replace(/,/g, ''));
+      if (followersMatch) {
+        profileData.followers = parseInstagramNumber(followersMatch[1]);
+      }
+      if (followingMatch) {
+        profileData.following = parseInstagramNumber(followingMatch[1]);
+      }
+      if (postsMatch) {
+        profileData.posts = parseInstagramNumber(postsMatch[1]);
+      }
+
+      // Extract bio (text before stats)
+      const bioMatch = desc.split(/\d+\s*(Followers|Following|Posts)/)[0].trim();
+      if (bioMatch) {
+        profileData.bio = bioMatch;
+      }
+    }
+
+    if (imageMatch && !profileData.profilePicUrl) {
+      profileData.profilePicUrl = imageMatch[1];
+    }
+
+    // Method 3: Extract from inline JSON (most reliable for counts)
+    const followersJsonMatch = html.match(/"edge_followed_by":\s*{\s*"count":\s*(\d+)\s*}/);
+    const followingJsonMatch = html.match(/"edge_follow":\s*{\s*"count":\s*(\d+)\s*}/);
+    const postsJsonMatch = html.match(/"edge_owner_to_timeline_media":\s*{\s*"count":\s*(\d+)\s*}/);
+    const verifiedMatch = html.match(/"is_verified":\s*(true|false)/);
+    const fullNameMatch = html.match(/"full_name":\s*"([^"]+)"/);
+    const biographyMatch = html.match(/"biography":\s*"([^"]+)"/);
+    const profilePicMatch = html.match(/"profile_pic_url_hd":\s*"([^"]+)"/);
+
+    if (followersJsonMatch) {
+      profileData.followers = parseInt(followersJsonMatch[1]);
+    }
+    if (followingJsonMatch) {
+      profileData.following = parseInt(followingJsonMatch[1]);
+    }
+    if (postsJsonMatch) {
+      profileData.posts = parseInt(postsJsonMatch[1]);
+    }
+    if (verifiedMatch) {
+      profileData.isVerified = verifiedMatch[1] === 'true';
+    }
+    if (fullNameMatch) {
+      profileData.name = fullNameMatch[1];
+    }
+    if (biographyMatch) {
+      profileData.bio = biographyMatch[1].replace(/\\n/g, '\n').replace(/\\"/g, '"');
+    }
+    if (profilePicMatch) {
+      profileData.profilePicUrl = profilePicMatch[1].replace(/\\u0026/g, '&');
     }
 
     return res.json({
       success: true,
-      data: basicData
+      data: profileData
     });
 
   } catch (error) {
@@ -231,7 +232,7 @@ app.get('/api/user/:username', async (req, res) => {
     if (error.response && error.response.status === 429) {
       return res.status(429).json({ 
         success: false,
-        error: 'Instagram rate limit reached. Try again later or configure proxies.' 
+        error: 'Rate limit reached. Try again later.' 
       });
     }
 
@@ -243,14 +244,40 @@ app.get('/api/user/:username', async (req, res) => {
   }
 });
 
+// Helper function to parse Instagram numbers (1.2M, 500K, etc.)
+function parseInstagramNumber(str) {
+  if (!str) return null;
+  
+  str = str.toString().trim().toUpperCase();
+  
+  // Remove commas
+  str = str.replace(/,/g, '');
+  
+  // Handle K (thousands)
+  if (str.includes('K')) {
+    return Math.round(parseFloat(str.replace('K', '')) * 1000);
+  }
+  
+  // Handle M (millions)
+  if (str.includes('M')) {
+    return Math.round(parseFloat(str.replace('M', '')) * 1000000);
+  }
+  
+  // Handle B (billions)
+  if (str.includes('B')) {
+    return Math.round(parseFloat(str.replace('B', '')) * 1000000000);
+  }
+  
+  // Regular number
+  return parseInt(str);
+}
+
 // Health check endpoint
 app.get('/', (req, res) => {
-  const proxies = getProxyList();
   res.json({ 
     status: 'OK',
     message: 'Instagram Info API - Real-time with Anti-Ban Protection',
     config: {
-      proxiesConfigured: proxies.length,
       userAgents: userAgents.length
     },
     endpoints: {
@@ -263,7 +290,6 @@ app.get('/', (req, res) => {
 // Start server
 app.listen(PORT, () => {
   console.log(`Server is running on port ${PORT}`);
-  console.log(`Proxies configured: ${getProxyList().length}`);
   console.log(`User agents available: ${userAgents.length}`);
   console.log(`Try: http://localhost:${PORT}/api/user/instagram`);
 });
